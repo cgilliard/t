@@ -124,3 +124,5 @@ run bin/full_node.bin \
 	lib/stdlib.fam \
 	lib/build.fam \
 	`cat scripts/files.txt`
+cat resources/bible.compressed >> bin/full_node.bin
+
