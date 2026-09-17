@@ -397,6 +397,7 @@ Test {
 		4C lit alloc tqset                  \ ( ds )
 		0 lit over 10 lit + !               \ next = 0
 		dup nslot swap drop 0 lit asrt_eq   \ -> 0   (nslot returns ( ds id ); keep id)
+		drop                                 \ ( consumes ds )
 	}
 	\ nslot wraps: starting at next=4 yields 4 then sets next back to 0.
 	slot_wrap {
@@ -404,6 +405,7 @@ Test {
 		4 lit over 10 lit + !      \ next = 4
 		dup nslot drop             \ id 4 ; ( ds )
 		10 lit + @ 0 lit asrt_eq   \ next wrapped to 0 (nslots=5)
+		drop                       \ ( consumes ds )
 	}
 	\ vreq builds slot 0's 3-descriptor chain + header for a WRITE (type 1).
 	req_wr {
@@ -466,6 +468,7 @@ Test {
 		dup 4 lit + @ 2010 lit + 1 lit swap c!    \ device wrote status = IOERR(1)
 		vpoll
 		0 lit vstat 2 lit asrt_eq                 \ vstat = status+1 = 2 (error, reaped)
+		drop                                       \ ( consumes ds; vstat hands it back )
 	}
 	\ vpoll reaps a completion the device posted (used.ring[0].id = 0 -> slot 0) into done[].
 	poll_reap {
@@ -488,6 +491,7 @@ Test {
 		dup 4 lit + @ 1002 lit + 1 lit swap h!   \ used.idx = 1
 		vpoll
 		4 lit vstat 1 lit asrt_eq                \ done[4] = 1 (status 0 + 1)
+		drop                                      \ ( consumes ds; vstat hands it back )
 	}
 	\ vpoll on an empty used ring (idx == cursor) is a no-op.
 	poll_empty {
@@ -502,7 +506,8 @@ Test {
 		4C lit alloc tqset
 		1 lit over 40 lit + @ 8 lit + !           \ done[2] = 1 (donep + 2*4)
 		dup 2 lit vstat swap drop 1 lit asrt_eq   \ done[2] reads 1
-		1 lit vstat 0 lit asrt_eq                 \ done[1] reads 0   ( consumes ds )
+		1 lit vstat 0 lit asrt_eq                 \ done[1] reads 0
+		drop                                       \ ( consumes ds; vstat hands it back )
 	}
 	\ vflush, writeback (device offers FLUSH): builds a type-4 no-data 2-descriptor chain.
 	flush_wb {

@@ -8,6 +8,13 @@
 \ closes the chain and prints the summary. On the first failing asrt_eq/assert,
 \ prints "Failed: <name>" and exits non-zero (first failure halts).
 \
+\ Stack-leak check: `sp` IS the data stack pointer, and `{`/`_tdone` snapshot it
+\ (via `sp@`) at the start of each test and compare on the way out. A test body
+\ that pushes without a matching pop (or vice versa) fails as "FAILED (stack
+\ leak)", same exit path as a failed asrt_eq/assert — a test must leave the
+\ stack exactly as it found it, even when its last line "consumes" the value
+\ under test.
+\
 \ Control-flow plumbing (compile time): `_skip` plants a forward `jal` before the
 \ user source; each `Test` `jpat!`s the pending jump to its suite start (so main
 \ is jumped over) and each `}` plants the next forward jump; `_tend` `jpat!`s the
@@ -22,6 +29,7 @@
 : tname  variable ;
 : tcount variable ;
 : tstart variable ;   \ mtime (ticks) captured at the first test
+: _sp0   variable ;   \ data-stack pointer snapshot at the current test's start
 
 \ _now ( -- ticks )  RUNTIME: read the machine timer low word (CLINT mtime @
 \        0x0200BFF8). QEMU virt ticks at 10 MHz (100 ns/tick).
@@ -30,6 +38,16 @@ B7C20002 ,   \ lui  t0, 0x0200C
 03A382FF ,   \ lw   t1, -8(t0)         ( mtime low @ 0x0200BFF8 )
 1301C1FF ,   \ addi sp, sp, -4
 23206100 ,   \ sw   t1, 0(sp)
+;
+
+\ sp@ ( -- n )  RUNTIME: push the data-stack pointer as it was BEFORE this
+\        word ran (the depth at the call site) — used to snapshot/verify
+\        stack balance around a test body. `:M` (inlined): must not disturb
+\        sp itself before reading it.
+:M sp@
+93020100 ,   \ addi t0, sp, 0   ( t0 = sp, before this word's own push )
+1301C1FF ,   \ addi sp, sp, -4  ( push a slot )
+23205100 ,   \ sw   t0, 0(sp)   ( store the pre-push sp value )
 ;
 
 \ _elapsed ( -- )  RUNTIME: print (now - tstart) as "S.CCs" (10 MHz timebase:
@@ -68,6 +86,20 @@ B7021000 ,   \ lui  t0, 0x100           ( SiFive finisher )
 6F000000 ,   \ jal  x0, .               ( spin )
 ;
 
+\ _leak ( -- )  RUNTIME: report the current test FAILED because it left the
+\        data stack unbalanced (pushed more than it popped, or vice versa),
+\        then exit 1 — same no-bugs policy / exit path as _fail.
+: _leak
+"test " puts tname @ puts " ... " puts _red "FAILED (stack leak)" puts _rst 0A lit putc
+0A lit putc
+"test result: " puts _red "FAILED" puts _rst 0A lit putc
+B7021000 ,   \ lui  t0, 0x100           ( SiFive finisher )
+37330100 ,   \ lui  t1, 0x13
+13033333 ,   \ addi t1, t1, 0x333       ( 0x00013333 = FAIL -> exit 1 )
+23A06200 ,   \ sw   t1, 0(t0)
+6F000000 ,   \ jal  x0, .               ( spin )
+;
+
 \ asrt_eq ( actual expected -- )  fail unless equal.
 : asrt_eq <> if _fail then ;
 
@@ -76,8 +108,13 @@ B7021000 ,   \ lui  t0, 0x100           ( SiFive finisher )
 
 \ _tdone ( -- )  RUNTIME: report the last test as ok, then the result line. Reached
 \        by a `jal` from `_tend` (no return-id), so it must NOT return — ends in `bye`.
+\        No name-push happens between the last test's body and here, so the
+\        stack-balance check compares sp directly against the snapshot (no offset).
 : _tdone
-tcount @ if _okprev then
+tcount @ if
+sp@ _sp0 @ <> if _leak then
+_okprev
+then
 0A lit putc
 "test result: " puts _grn "ok" puts _rst ". " puts
 tcount @ u.
@@ -187,12 +224,19 @@ B3E26200 ,   \ or t0,t0,t1
 
 \ { ( nameaddr -- )  RUNTIME: report the PREVIOUS test as ok (delayed by one, since
 \        "ok" is only known once the body finished without failing), then record this
-\        test's name and bump the counter.
+\        test's name and bump the counter. Also checks the PREVIOUS test's stack
+\        balance: nameaddr for THIS test is already pushed (sp is 4 lower than the
+\        clean baseline the previous body should have restored), hence the `4 lit +`
+\        before comparing against the `_sp0` snapshot taken when that test started.
 : {
-tcount @ if _okprev then
+tcount @ if
+sp@ 4 lit + _sp0 @ <> if _leak then
+_okprev
+then
 tcount @ 0= if _now tstart ! then   \ first test: capture the start time
 tname !
 tcount @ 1 lit + tcount !
+sp@ _sp0 !   \ snapshot the (now clean) stack depth for the test about to run
 ;
 
 \ } ( C: -- )  COMPILE-TIME: lookahead. A closing `}` ends the suite: plant a
