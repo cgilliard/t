@@ -563,6 +563,18 @@ Test {
 \ Benches (./tools/fam --bench src/fence.fam src/disk.fam; add --disk=IMG for
 \ the real-device ones — without a disk they self-skip via bfind and report a
 \ near-zero time).  10 MHz timebase: ns/op = ticks*100/ops (bops).
+\
+\ The set is built to be read in PAIRS, so each number has a baseline to sit
+\ against rather than standing alone:
+\   stage10k            staging cost only, no device — the floor for everything below
+\   sync1k  / syncrd1k  one request in flight: write vs read round-trip latency
+\   batch1k / batchrd1k waves of 50, drained to empty each wave: write vs read
+\   batch1k / pipe1k    same writes, drain-to-empty vs sliding window
+\   batch1k / durable1k same writes, page-cache vs flushed-per-wave (durable)
+\   flush100            the durability barrier on its own
+\ Every body runs ONCE, and the device benches swing ~25% run to run, so treat a
+\ single figure as one sample: compare medians across several runs before
+\ concluding a change helped.
 \ ──────────────────────────────────────────────────────────────────────────────
 
 \ bfind ( -- dev|0 )  probe for a virtio-blk device WITHOUT halting (unlike
@@ -629,6 +641,129 @@ Bench {
 				repeat drop
 				2 lit pick vkick drop
 				begin 2 lit pick vpoll dup C lit + @ over 8 lit + @ = swap drop until
+				32 lit +
+			repeat drop drop drop
+			3E8 lit bops
+		else bskip then
+	}
+	\ REAL device: 1000 single-sector writes with a SLIDING WINDOW.  Same waves of
+	\ 50 + one vkick as batch1k, but instead of draining to EMPTY between waves it
+	\ polls only until fewer than `win` requests are still outstanding, so the ring
+	\ stays topped up and the device never idles waiting to be refilled.  batch1k
+	\ pays one full round-trip per wave (20 of them); this pays one only when the
+	\ window is actually full.  win = nslots/2 keeps peak depth (win + 50) well
+	\ under nslots, so the rotating slot allocator never reuses a live slot.
+	pipe1k {
+		bfind ?dup if
+			48 lit alloc swap over !
+			D000 lit alloc FFF lit + FFFFF000 lit and dup qzero over 4 lit + !
+			vblkinit
+			200 lit alloc                  \ ( ds buf )
+			over 14 lit + @ 1 lit rshift   \ win = nslots/2   ( ds buf win )
+			bgo
+			0 lit begin dup 3E8 lit u< while
+				0 lit begin dup 32 lit u< while
+					4 lit pick over 3 lit pick + 7FF lit and 5 lit pick 1 lit vqwrite drop drop
+					1 lit +
+				repeat drop
+				3 lit pick vkick drop
+				\ wait only until outstanding (subd - usd) drops below the window
+				begin 3 lit pick vpoll dup 8 lit + @ over C lit + @ - 3 lit pick u< swap drop until
+				32 lit +
+			repeat
+			\ final drain: everything still in flight must land before the clock stops
+			begin 3 lit pick vpoll dup C lit + @ over 8 lit + @ = swap drop until
+			drop drop drop drop
+			3E8 lit bops
+		else bskip then
+	}
+	\ REAL device: 1000 sync single-sector READS (kick + vwait each) — the read
+	\ mirror of sync1k, so the two numbers are directly comparable.
+	syncrd1k {
+		bfind ?dup if
+			48 lit alloc swap over !
+			D000 lit alloc FFF lit + FFFFF000 lit and dup qzero over 4 lit + !
+			vblkinit
+			200 lit alloc              \ ( ds buf )
+			bgo
+			0 lit begin dup 3E8 lit u< while
+				2 lit pick over 7FF lit and 3 lit pick vread vwait drop drop
+				1 lit +
+			repeat drop drop drop
+			3E8 lit bops
+		else bskip then
+	}
+	\ REAL device: 1000 single-sector READS staged in waves of 50 with ONE vkick
+	\ per wave — the read mirror of batch1k.  Unlike a write (where the device only
+	\ READS the buffer, so one buffer can back every request) a read has the device
+	\ DMA INTO the buffer, so each request in a wave gets its own 512-byte slice at
+	\ buf + j*0x200 and 50 concurrent DMAs never target the same bytes.
+	batchrd1k {
+		bfind ?dup if
+			48 lit alloc swap over !
+			D000 lit alloc FFF lit + FFFFF000 lit and dup qzero over 4 lit + !
+			vblkinit
+			6400 lit alloc             \ ( ds buf )  50 x 512B landing slots
+			bgo
+			0 lit begin dup 3E8 lit u< while
+				0 lit begin dup 32 lit u< while
+					3 lit pick over 3 lit pick + 7FF lit and
+					4 lit pick 3 lit pick 9 lit lshift +   \ buf + j*512
+					1 lit vqread drop drop
+					1 lit +
+				repeat drop
+				2 lit pick vkick drop
+				begin 2 lit pick vpoll dup C lit + @ over 8 lit + @ = swap drop until
+				32 lit +
+			repeat drop drop drop
+			3E8 lit bops
+		else bskip then
+	}
+	\ REAL device: 100 raw durability barriers (vflush + vwait each) with nothing
+	\ staged behind them — isolates the cost of the barrier itself.  Self-skips when
+	\ the device did not offer VIRTIO_BLK_F_FLUSH (writethrough: vflush returns the
+	\ -1 sentinel without submitting, so there is nothing to time — and nothing to
+	\ vwait on, since done[] is only indexed by a real slot id).
+	flush100 {
+		bfind ?dup if
+			48 lit alloc swap over !
+			D000 lit alloc FFF lit + FFFFF000 lit and dup qzero over 4 lit + !
+			vblkinit
+			dup @ 10 lit + @ 200 lit and if
+				\ PRIME, unmeasured: the benches ahead of this one leave thousands of
+				\ dirty sectors in the host page cache, and the first flush would pay
+				\ to write every one of them back — that cost belongs to them, not to
+				\ the barrier.  Flush once before bgo so the 100 timed barriers each
+				\ start from a clean cache and measure the barrier itself.
+				dup vflush dup FFFFFFFF lit <> if vwait then drop drop
+				bgo
+				0 lit begin dup 64 lit u< while
+					over vflush dup FFFFFFFF lit <> if vwait then drop drop
+					1 lit +
+				repeat drop drop
+				64 lit bops
+			else drop bskip then
+		else bskip then
+	}
+	\ REAL device: 1000 DURABLE single-sector writes — batch1k's waves of 50 (one
+	\ vkick + full drain) with each wave then sealed by a vflush the bench waits on.
+	\ This is what a node that must not lose acknowledged state actually pays;
+	\ batch1k's figure is writes landing in the host page cache, not on the platter.
+	durable1k {
+		bfind ?dup if
+			48 lit alloc swap over !
+			D000 lit alloc FFF lit + FFFFF000 lit and dup qzero over 4 lit + !
+			vblkinit
+			200 lit alloc              \ ( ds buf )
+			bgo
+			0 lit begin dup 3E8 lit u< while
+				0 lit begin dup 32 lit u< while
+					3 lit pick over 3 lit pick + 7FF lit and 4 lit pick 1 lit vqwrite drop drop
+					1 lit +
+				repeat drop
+				2 lit pick vkick drop
+				begin 2 lit pick vpoll dup C lit + @ over 8 lit + @ = swap drop until
+				2 lit pick vflush dup FFFFFFFF lit <> if vwait then drop drop
 				32 lit +
 			repeat drop drop drop
 			3E8 lit bops
