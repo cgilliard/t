@@ -594,6 +594,61 @@ Test {
 	until
 ;
 
+\ ── bench sector geometry ─────────────────────────────────────────────────────
+\ The device benches used to write 1000 CONSECUTIVE sectors, so a whole wave of 50
+\ landed inside about seven host 4 KiB pages and a flush had almost nothing to
+\ scatter — which also meant the image size was irrelevant: only the first 512 KiB
+\ was ever touched, however big the file was.  They now stride, so each request
+\ lands on its own page and a flush does realistic scattered writeback.  All
+\ figures in 512-byte sectors:
+\   stride 0x40      32 KiB apart, comfortably past one host page
+\   span   0xF9C1    999 * 0x40 + 1, about 31 MiB, for 1000 requests
+\   mask   0x1FFFF   clamps to the 64 MiB image scripts/bench.sh creates
+\ Grow the stride or the request count and you must grow the image too, or bfits
+\ will skip the run rather than let it quietly benchmark failures.
+
+\ bfits ( ds -- ds flag )  does the attached disk actually cover that span?
+\ Capacity, in 512-byte sectors, is the first field of virtio-blk config space at
+\ dev+0x100, with the high word at dev+0x104.  This guard matters more than it
+\ looks.  An undersized image makes every out-of-range request fail with IOERR,
+\ and because a bench asserts nothing and vwait returns on ANY nonzero done[]
+\ entry — error codes included — the run posts a FASTER time for doing less work.
+\ Measured on a disk 16x too small, durable1k reported 1776 ns/op against a true
+\ 7569: a 4x "speedup" that was really an 87% failure rate.
+: bfits
+	dup @ 104 lit + @ if
+		FFFFFFFF lit                      \ capacity >= 4 GiB: certainly enough
+	else
+		dup @ 100 lit + @ F9C1 lit u< 0=  \ cap >= span ?
+	then
+;
+
+\ bok ( ds -- ds )  post-run sanity check — call AFTER bstop so it is not timed.
+\ One write to sector 0 has to actually report success.  Without it a wholesale
+\ device failure still yields a plausible-looking number, because a bench makes no
+\ assertion about its own I/O.  bfits rules out the undersized-disk case up front;
+\ this catches the rest.
+\ Deliberately does NOT use asrt_eq: that word comes from lib/test.fam and
+\ lib/bench.fam, but an ordinary build prepends lib/build.fam, which has no such
+\ word — and a `:` body is compiled even when the Bench block that calls it is
+\ being consumed.  So it halts via the SiFive finisher directly (exit 1), the same
+\ way _fail does, using nothing outside the stdlib.
+: bok
+	200 lit alloc                        \ ( ds buf )
+	over 0 lit 2 lit pick vwrite vwait   \ ( ds buf ds id )
+	vstat swap drop                      \ ( ds buf st )
+	1 lit <> if                          \ 1 = completed ok; anything else is fatal
+		0A lit putc
+		"bok: device write FAILED - every timing above is meaningless" puts 0A lit putc
+		B7021000 ,   \ lui  t0, 0x100           ( SiFive finisher )
+		37330100 ,   \ lui  t1, 0x13
+		13033333 ,   \ addi t1, t1, 0x333       ( 0x00013333 = FAIL -> exit 1 )
+		23A06200 ,   \ sw   t1, 0(t0)
+		6F000000 ,   \ jal  x0, .               ( spin )
+	then
+	drop
+;
+
 Bench {
 	\ vqsub staging cost, no device involved (staging never touches ds.dev):
 	\ 10000 single-sector writes staged on a fake qnum=16 handle.
@@ -616,13 +671,17 @@ Bench {
 			48 lit alloc swap over !   \ ( ds ) with ds.dev set
 			D000 lit alloc FFF lit + FFFFF000 lit and dup qzero over 4 lit + !
 			vblkinit
-			200 lit alloc              \ ( ds buf )
-			bgo                        \ qzero/vblkinit setup isn't measured
-			0 lit begin dup 3E8 lit u< while
-				2 lit pick over 7FF lit and 3 lit pick vwrite vwait drop drop
-				1 lit +
-			repeat drop drop drop
-			3E8 lit bops
+			bfits if
+				200 lit alloc              \ ( ds buf )
+				bgo                        \ qzero/vblkinit setup isn't measured
+				0 lit begin dup 3E8 lit u< while
+					2 lit pick over 6 lit lshift 1FFFF lit and 3 lit pick vwrite vwait drop drop
+					1 lit +
+				repeat drop drop
+				bstop                      \ clock off before the untimed check
+				bok drop
+				3E8 lit bops
+			else drop bskip then
 		else bskip then
 	}
 	\ REAL device: 1000 single-sector writes staged in waves of 50 with ONE
@@ -632,18 +691,22 @@ Bench {
 			48 lit alloc swap over !
 			D000 lit alloc FFF lit + FFFFF000 lit and dup qzero over 4 lit + !
 			vblkinit
-			200 lit alloc              \ ( ds buf )
-			bgo                        \ qzero/vblkinit setup isn't measured
-			0 lit begin dup 3E8 lit u< while
-				0 lit begin dup 32 lit u< while
-					3 lit pick over 3 lit pick + 7FF lit and 4 lit pick 1 lit vqwrite drop drop
-					1 lit +
-				repeat drop
-				2 lit pick vkick drop
-				begin 2 lit pick vpoll dup C lit + @ over 8 lit + @ = swap drop until
-				32 lit +
-			repeat drop drop drop
-			3E8 lit bops
+			bfits if
+				200 lit alloc              \ ( ds buf )
+				bgo                        \ qzero/vblkinit setup isn't measured
+				0 lit begin dup 3E8 lit u< while
+					0 lit begin dup 32 lit u< while
+						3 lit pick over 3 lit pick + 6 lit lshift 1FFFF lit and 4 lit pick 1 lit vqwrite drop drop
+						1 lit +
+					repeat drop
+					2 lit pick vkick drop
+					begin 2 lit pick vpoll dup C lit + @ over 8 lit + @ = swap drop until
+					32 lit +
+				repeat drop drop
+				bstop
+				bok drop
+				3E8 lit bops
+			else drop bskip then
 		else bskip then
 	}
 	\ REAL device: 1000 single-sector writes with a SLIDING WINDOW.  Same waves of
@@ -658,24 +721,27 @@ Bench {
 			48 lit alloc swap over !
 			D000 lit alloc FFF lit + FFFFF000 lit and dup qzero over 4 lit + !
 			vblkinit
-			200 lit alloc                  \ ( ds buf )
-			over 14 lit + @ 1 lit rshift   \ win = nslots/2   ( ds buf win )
-			bgo
-			0 lit begin dup 3E8 lit u< while
-				0 lit begin dup 32 lit u< while
-					4 lit pick over 3 lit pick + 7FF lit and 5 lit pick 1 lit vqwrite drop drop
-					1 lit +
-				repeat drop
-				3 lit pick vkick drop
-				\ wait only until outstanding (subd - usd) drops below the window
-				begin 3 lit pick vpoll dup 8 lit + @ over C lit + @ - 3 lit pick u< swap drop until
-				32 lit +
-			repeat
-			\ final drain: everything still in flight must land before the clock stops
-			begin 3 lit pick vpoll dup C lit + @ over 8 lit + @ = swap drop until
-			drop drop drop drop
-			3E8 lit bops
-		else bskip then
+			bfits if
+				200 lit alloc                  \ ( ds buf )
+				over 14 lit + @ 1 lit rshift   \ win = nslots/2   ( ds buf win )
+				bgo
+				0 lit begin dup 3E8 lit u< while
+					0 lit begin dup 32 lit u< while
+						4 lit pick over 3 lit pick + 6 lit lshift 1FFFF lit and 5 lit pick 1 lit vqwrite drop drop
+						1 lit +
+					repeat drop
+					3 lit pick vkick drop
+					\ wait only until outstanding (subd - usd) drops below the window
+					begin 3 lit pick vpoll dup 8 lit + @ over C lit + @ - 3 lit pick u< swap drop until
+					32 lit +
+				repeat
+				\ final drain: everything still in flight must land before the clock stops
+				begin 3 lit pick vpoll dup C lit + @ over 8 lit + @ = swap drop until
+				drop drop drop
+				bstop
+				bok drop
+				3E8 lit bops
+			else drop bskip then
 	}
 	\ REAL device: 1000 sync single-sector READS (kick + vwait each) — the read
 	\ mirror of sync1k, so the two numbers are directly comparable.
@@ -684,14 +750,17 @@ Bench {
 			48 lit alloc swap over !
 			D000 lit alloc FFF lit + FFFFF000 lit and dup qzero over 4 lit + !
 			vblkinit
-			200 lit alloc              \ ( ds buf )
-			bgo
-			0 lit begin dup 3E8 lit u< while
-				2 lit pick over 7FF lit and 3 lit pick vread vwait drop drop
-				1 lit +
-			repeat drop drop drop
-			3E8 lit bops
-		else bskip then
+			bfits if
+				200 lit alloc              \ ( ds buf )
+				bgo
+				0 lit begin dup 3E8 lit u< while
+					2 lit pick over 6 lit lshift 1FFFF lit and 3 lit pick vread vwait drop drop
+					1 lit +
+				repeat drop drop
+				bstop
+				bok drop
+				3E8 lit bops
+			else drop bskip then
 	}
 	\ REAL device: 1000 single-sector READS staged in waves of 50 with ONE vkick
 	\ per wave — the read mirror of batch1k.  Unlike a write (where the device only
@@ -703,21 +772,24 @@ Bench {
 			48 lit alloc swap over !
 			D000 lit alloc FFF lit + FFFFF000 lit and dup qzero over 4 lit + !
 			vblkinit
-			6400 lit alloc             \ ( ds buf )  50 x 512B landing slots
-			bgo
-			0 lit begin dup 3E8 lit u< while
-				0 lit begin dup 32 lit u< while
-					3 lit pick over 3 lit pick + 7FF lit and
-					4 lit pick 3 lit pick 9 lit lshift +   \ buf + j*512
-					1 lit vqread drop drop
-					1 lit +
-				repeat drop
-				2 lit pick vkick drop
-				begin 2 lit pick vpoll dup C lit + @ over 8 lit + @ = swap drop until
-				32 lit +
-			repeat drop drop drop
-			3E8 lit bops
-		else bskip then
+			bfits if
+				6400 lit alloc             \ ( ds buf )  50 x 512B landing slots
+				bgo
+				0 lit begin dup 3E8 lit u< while
+					0 lit begin dup 32 lit u< while
+						3 lit pick over 3 lit pick + 6 lit lshift 1FFFF lit and
+						4 lit pick 3 lit pick 9 lit lshift +   \ buf + j*512
+						1 lit vqread drop drop
+						1 lit +
+					repeat drop
+					2 lit pick vkick drop
+					begin 2 lit pick vpoll dup C lit + @ over 8 lit + @ = swap drop until
+					32 lit +
+				repeat drop drop
+				bstop
+				bok drop
+				3E8 lit bops
+			else drop bskip then
 	}
 	\ REAL device: 100 raw durability barriers (vflush + vwait each) with nothing
 	\ staged behind them — isolates the cost of the barrier itself.  Self-skips when
@@ -740,7 +812,9 @@ Bench {
 				0 lit begin dup 64 lit u< while
 					over vflush dup FFFFFFFF lit <> if vwait then drop drop
 					1 lit +
-				repeat drop drop
+				repeat drop
+				bstop
+				bok drop
 				64 lit bops
 			else drop bskip then
 		else bskip then
@@ -754,19 +828,28 @@ Bench {
 			48 lit alloc swap over !
 			D000 lit alloc FFF lit + FFFFF000 lit and dup qzero over 4 lit + !
 			vblkinit
-			200 lit alloc              \ ( ds buf )
-			bgo
-			0 lit begin dup 3E8 lit u< while
-				0 lit begin dup 32 lit u< while
-					3 lit pick over 3 lit pick + 7FF lit and 4 lit pick 1 lit vqwrite drop drop
-					1 lit +
-				repeat drop
-				2 lit pick vkick drop
-				begin 2 lit pick vpoll dup C lit + @ over 8 lit + @ = swap drop until
-				2 lit pick vflush dup FFFFFFFF lit <> if vwait then drop drop
-				32 lit +
-			repeat drop drop drop
-			3E8 lit bops
-		else bskip then
+			bfits if
+				200 lit alloc              \ ( ds buf )
+				\ PRIME, unmeasured: the image was just written by dd and the benches
+				\ ahead of this one leave dirty sectors behind.  Without this, wave 1's
+				\ flush pays to write ALL of that back.  In practice flush100 runs just
+				\ ahead and already leaves the cache clean, so this rarely changes the
+				\ number — it is here so durable1k does not silently depend on that.
+				over vflush dup FFFFFFFF lit <> if vwait then drop drop
+				bgo
+				0 lit begin dup 3E8 lit u< while
+					0 lit begin dup 32 lit u< while
+						3 lit pick over 3 lit pick + 6 lit lshift 1FFFF lit and 4 lit pick 1 lit vqwrite drop drop
+						1 lit +
+					repeat drop
+					2 lit pick vkick drop
+					begin 2 lit pick vpoll dup C lit + @ over 8 lit + @ = swap drop until
+					2 lit pick vflush dup FFFFFFFF lit <> if vwait then drop drop
+					32 lit +
+				repeat drop drop
+				bstop
+				bok drop
+				3E8 lit bops
+			else drop bskip then
 	}
 }
